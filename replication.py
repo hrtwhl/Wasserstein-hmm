@@ -56,7 +56,7 @@ N_ASSETS = len(ASSETS)
 # Dates — UUP inception (Feb 2007) is the binding constraint
 DATA_START = "2007-02-15"
 DATA_END   = "2026-02-15"
-OOS_START  = "2023-05-01"      # matches paper's figures
+OOS_START  = "2011-03-01"      # matches paper's figures
 
 # Features (paper sec. 4)
 VOL_WINDOW = 60
@@ -69,11 +69,15 @@ ETA              = 0.05        # template exponential-smoothing rate
 LAMBDA_K         = 5.0         # complexity penalty per state
 VAL_SLICE_DAYS   = 252         # validation slice for predictive K-score
 ORDER_SELECT_FREQ = 5          # K-selection cadence (weekly)
-HMM_FIT_FREQ     = 1           # paper says daily; set higher for speed
-REFIT_DAILY      = True        # False = refit only at order-selection dates
+HMM_FIT_FREQ     = 5           # refit HMM every 5 days (weekly)
+REFIT_DAILY      = False       # False = refit only at fit-frequency dates
 HMM_INIT_WINDOW  = 1000        # days for initial template calibration
 HMM_COV_TYPE     = "full"
 HMM_N_ITER       = 50
+
+# Rebalance frequencies to compare (in trading days)
+# 1 = daily, 5 = weekly (every Mon), 21 = monthly (~first trading day of month)
+REBALANCE_FREQS = {"daily": 1, "weekly": 5, "monthly": 21}
 
 # KNN baseline (paper sec. 6)
 KNN_NEIGHBOURS   = 100
@@ -387,21 +391,53 @@ def _progress(name, i, n, t0):
         print(f"  [{name}] {i+1}/{n}  elapsed={elapsed:.0f}s  eta={eta:.0f}s", flush=True)
 
 
-def run_parametric(features, returns, oos_start=OOS_START, init_window=HMM_INIT_WINDOW):
-    print("Parametric (Wasserstein HMM + MVO) backtest...")
+def _hmm_signal_cache_key():
+    """Build a hash-like key from all HMM-relevant config so cached signals
+    are reused only when the HMM-side parameters are unchanged."""
+    parts = (DATA_START, DATA_END, OOS_START,
+             tuple(sorted(TICKERS.items())),
+             VOL_WINDOW, MOM_WINDOW,
+             K_MIN, K_MAX, G_TEMPLATES, ETA, LAMBDA_K,
+             VAL_SLICE_DAYS, ORDER_SELECT_FREQ, HMM_FIT_FREQ, REFIT_DAILY,
+             HMM_INIT_WINDOW, HMM_COV_TYPE, HMM_N_ITER, SEED)
+    import hashlib
+    return hashlib.md5(repr(parts).encode()).hexdigest()[:12]
+
+
+def compute_hmm_signal(features, returns,
+                       oos_start=OOS_START, init_window=HMM_INIT_WINDOW,
+                       use_cache=True) -> dict:
+    """Compute the daily HMM signal: template probabilities and mixture
+    moments. This is the EXPENSIVE step (~minutes/hours).
+
+    Independent of trading frequency or transaction costs, so we cache it
+    to disk and reuse across rebalance-frequency experiments.
+
+    Returns dict with daily series:
+        mu_t (N,)             — mixture mean over assets
+        sigma_t (N, N)        — mixture covariance over assets
+        p_template (G,)       — template probabilities
+        K, dominant_g         — diagnostics
+    """
+    DATA_CACHE.mkdir(parents=True, exist_ok=True)
+    key = _hmm_signal_cache_key()
+    cache_file = DATA_CACHE / f"hmm_signal_{key}.pkl"
+    if use_cache and cache_file.exists():
+        print(f"  loading cached HMM signal from {cache_file.name}")
+        return pd.read_pickle(cache_file)
+
+    print("  computing HMM signal (this is the slow step)...")
     feat_idx = features.index
     oos_idx = feat_idx[feat_idx >= pd.Timestamp(oos_start)]
     if len(oos_idx) == 0:
         raise ValueError(f"No OOS dates >= {oos_start}")
 
-    # Initialise templates on calibration window
     init_end = feat_idx.get_indexer([oos_idx[0]])[0]
     init_X = features.values[max(0, init_end - init_window):init_end]
     model = WassersteinHMM()
     model.initialize_templates(init_X)
 
-    w_prev = np.full(N_ASSETS, 1.0 / N_ASSETS)
-    weights_rec, rets_rec, extras_rec = [], [], []
+    mus, covs, probs, ks, doms = [], [], [], [], []
     t0 = time.time()
     n = len(oos_idx)
 
@@ -415,20 +451,75 @@ def run_parametric(features, returns, oos_start=OOS_START, init_window=HMM_INIT_
         cov = out["cov_full"][:N_ASSETS, :N_ASSETS]
         cov = _shrink(cov, sample=R_hist[-min(750, len(R_hist)):] if len(R_hist) > 50 else None)
 
-        w = solve_mvo(mu, cov, w_prev)
-        r_t = float(returns.loc[t].values @ w)
+        mus.append(mu)
+        covs.append(cov)
+        probs.append(out["p_template"])
+        ks.append(out["K"])
+        doms.append(out["dominant_g"])
+        _progress("hmm-signal", i, n, t0)
 
+    signal = {
+        "dates":      oos_idx,
+        "mu":         np.array(mus),                         # (T, N)
+        "cov":        np.array(covs),                        # (T, N, N)
+        "p_template": np.array(probs),                       # (T, G)
+        "K":          np.array(ks),
+        "dominant_g": np.array(doms),
+    }
+    pd.to_pickle(signal, cache_file)
+    print(f"  cached HMM signal to {cache_file.name}")
+    return signal
+
+
+def run_parametric_from_signal(signal, returns, rebalance_every: int = 1):
+    """Run the trading layer using a pre-computed HMM signal.
+
+    This is the CHEAP step (~seconds). Vary `rebalance_every` to compare
+    trading frequencies without recomputing the HMM:
+        1   = daily rebalance
+        5   = weekly  rebalance (every 5 trading days)
+        21  = monthly rebalance (~21 trading days)
+
+    Between rebalance days the portfolio HOLDS its previous weights —
+    weight drift from differing asset returns is ignored (we re-set to
+    target weights on the next rebalance day, which is the standard
+    treatment in this kind of backtest).
+    """
+    dates = signal["dates"]
+    n = len(dates)
+    w_prev = np.full(N_ASSETS, 1.0 / N_ASSETS)
+    weights_rec, rets_rec, extras_rec = [], [], []
+
+    for i, t in enumerate(dates):
+        if i % rebalance_every == 0:
+            mu = signal["mu"][i]
+            cov = signal["cov"][i]
+            w = solve_mvo(mu, cov, w_prev)
+        else:
+            w = w_prev                                  # hold target weights
+
+        r_t = float(returns.loc[t].values @ w)
         weights_rec.append(pd.Series(w, index=ASSETS, name=t))
         rets_rec.append((t, r_t))
-        extras_rec.append({"date": t, "K": out["K"],
-                           "dominant_g": out["dominant_g"],
-                           **{f"p_template_{g}": p for g, p in enumerate(out["p_template"])}})
+        extras_rec.append({"date": t, "K": int(signal["K"][i]),
+                           "dominant_g": int(signal["dominant_g"][i]),
+                           **{f"p_template_{g}": p
+                              for g, p in enumerate(signal["p_template"][i])}})
         w_prev = w
-        _progress("param", i, n, t0)
 
     return BacktestResult(weights=pd.DataFrame(weights_rec),
                           returns=pd.Series({d: r for d, r in rets_rec}, name="ret"),
                           extras=pd.DataFrame(extras_rec).set_index("date"))
+
+
+def run_parametric(features, returns, oos_start=OOS_START,
+                   init_window=HMM_INIT_WINDOW, rebalance_every: int = 1):
+    """Convenience wrapper: compute (or load) the HMM signal and run the
+    trading layer at the requested rebalance frequency."""
+    print(f"Parametric backtest (rebalance every {rebalance_every} days)...")
+    signal = compute_hmm_signal(features, returns,
+                                oos_start=oos_start, init_window=init_window)
+    return run_parametric_from_signal(signal, returns, rebalance_every=rebalance_every)
 
 
 def run_knn(features, returns, oos_start=OOS_START):
@@ -677,6 +768,38 @@ def fig_benchmark_compare(param, ew, spx, out):
     return _save(fig, out / "fig11_benchmark_compare.png")
 
 
+def fig_freq_compare(results_by_freq: dict, out, fname="fig12_freq_compare.png"):
+    """Overlay cumulative PnL of the parametric strategy at different
+    rebalance frequencies."""
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    for label, res in results_by_freq.items():
+        axes[0].plot(res.returns.cumsum(), label=label)
+        axes[1].plot(turnover(res.weights).rolling(21).mean(), label=label)
+    axes[0].set_title("Cumulative PnL by Rebalance Frequency")
+    axes[0].set_ylabel("Cumulative Log Return")
+    axes[0].legend(loc="upper left")
+    axes[1].set_title("Turnover (21-day rolling mean) by Rebalance Frequency")
+    axes[1].set_ylabel("Daily Turnover")
+    axes[1].legend(loc="upper right")
+    return _save(fig, out / fname)
+
+
+def fig_freq_weights_grid(results_by_freq: dict, out, fname="fig13_freq_weights.png"):
+    """Stacked-weights plot, one row per rebalance frequency."""
+    n = len(results_by_freq)
+    fig, axes = plt.subplots(n, 1, figsize=(12, 3.5 * n), sharex=True)
+    if n == 1:
+        axes = [axes]
+    colours = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
+    for ax, (label, res) in zip(axes, results_by_freq.items()):
+        w = res.weights[ASSETS]
+        ax.stackplot(w.index, w.T.values, labels=ASSETS, colors=colours)
+        ax.set_ylim(0, 1)
+        ax.set_title(f"Portfolio Weights — {label}")
+        ax.legend(loc="upper left", ncol=5, fontsize=8)
+    return _save(fig, out / fname)
+
+
 # ============================================================================
 # 10. MAIN
 # ============================================================================
@@ -695,29 +818,41 @@ def main():
     print(f"prices  : {prices.shape}, {prices.index.min().date()} → {prices.index.max().date()}")
     print(f"features: {feats.shape}, OOS start: {OOS_START}")
 
-    banner("2. Parametric backtest (Wasserstein HMM + MVO)")
+    banner("2. Compute (or load cached) Wasserstein HMM signal")
     t0 = time.time()
-    param = run_parametric(feats, rets_a)
-    print(f"done in {(time.time()-t0)/60:.1f} min, {len(param.returns)} OOS days")
+    signal = compute_hmm_signal(feats, rets_a)
+    print(f"signal ready in {(time.time()-t0)/60:.1f} min  ({len(signal['dates'])} OOS days)")
 
-    banner("3. KNN backtest")
+    banner("3. Run parametric trading layer at three rebalance frequencies")
+    param_runs: dict[str, BacktestResult] = {}
+    for label, every in REBALANCE_FREQS.items():
+        t0 = time.time()
+        param_runs[label] = run_parametric_from_signal(signal, rets_a, rebalance_every=every)
+        print(f"  {label:<8} (every {every:>2}d)  done in {time.time()-t0:.1f}s")
+    # The "daily" run is the canonical parametric strategy for paper-style outputs
+    param = param_runs["daily"]
+
+    banner("4. KNN backtest")
     t0 = time.time()
     knn = run_knn(feats, rets_a)
     print(f"done in {(time.time()-t0)/60:.1f} min, {len(knn.returns)} OOS days")
 
     # Align onto common dates
     common = param.returns.index.intersection(knn.returns.index)
-    param.weights = param.weights.loc[common]
-    param.returns = param.returns.loc[common]
-    param.extras  = param.extras.loc[common]
-    knn.weights   = knn.weights.loc[common]
-    knn.returns   = knn.returns.loc[common]
+    for r in [*param_runs.values(), knn]:
+        r.weights = r.weights.loc[common]
+        r.returns = r.returns.loc[common]
+        if hasattr(r, "extras") and len(r.extras):
+            try:
+                r.extras = r.extras.loc[common]
+            except KeyError:
+                pass
 
-    banner("4. Passive benchmarks")
+    banner("5. Passive benchmarks")
     ew  = run_equal_weight(rets_a, oos_start=str(common.min().date()))
     spx = run_spx_buy_hold(rets_a, oos_start=str(common.min().date()))
 
-    banner("5. Tables")
+    banner("6. Tables")
     out = OUTPUT_DIR
     t1 = perf_table({"Non-Parametric (KNN+MVO)": knn,
                      "Parametric (W-HMM+MVO)":   param})
@@ -751,7 +886,15 @@ def main():
     print("\nTable 7 — vs benchmarks\n", t7.round(4))
     t7.to_csv(out / "table7_vs_benchmarks.csv")
 
-    banner("6. Figures")
+    # NEW: rebalance-frequency comparison
+    freq_results = {f"Parametric ({k})": v for k, v in param_runs.items()}
+    t8_perf = perf_table(freq_results)
+    t8_turn = turnover_table(freq_results)
+    t8 = pd.concat([t8_perf, t8_turn], axis=1)
+    print("\nTable 8 — rebalance-frequency comparison\n", t8.round(4))
+    t8.to_csv(out / "table8_freq_comparison.csv")
+
+    banner("7. Figures")
     fig_param_cum_pnl(param, dom_g, out)
     fig_knn_cum_pnl(knn, out)
     fig_turnover(knn, "Non-Parametric (KNN)",   out, "fig03_knn_turnover.png")
@@ -763,14 +906,17 @@ def main():
     fig_asset_sharpe_by_regime(t6, out)
     fig_stacked_pnl_by_regime(param, dom_g, out)
     fig_benchmark_compare(param, ew, spx, out)
+    fig_freq_compare(freq_results, out)
+    fig_freq_weights_grid(freq_results, out)
     print("Wrote figures to", out)
 
-    banner("7. Saving raw outputs")
-    param.weights.to_csv(out / "param_weights.csv")
-    param.returns.to_csv(out / "param_returns.csv")
-    param.extras.to_csv (out / "param_extras.csv")
-    knn.weights.to_csv  (out / "knn_weights.csv")
-    knn.returns.to_csv  (out / "knn_returns.csv")
+    banner("8. Saving raw outputs")
+    for label, res in param_runs.items():
+        res.weights.to_csv(out / f"param_{label}_weights.csv")
+        res.returns.to_csv(out / f"param_{label}_returns.csv")
+    param.extras.to_csv(out / "param_extras.csv")
+    knn.weights.to_csv (out / "knn_weights.csv")
+    knn.returns.to_csv (out / "knn_returns.csv")
     print("All artefacts written to", out.resolve())
 
 
