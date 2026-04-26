@@ -186,6 +186,8 @@ Per-regime portfolio Sharpe:
 | 2 | 169 | -0.19 | Equity-led recovery — strategy underperforms |
 | 4 | 47 | **-4.16** | Risk-on with USD weakness — worst regime |
 
+![Cumulative PnL by Regime](outputs/fig01_param_cum_pnl_by_regime.png)
+
 Regime 4 is the strategy's identifiable failure mode. In ~50 days across 15
 years, broad rallies in equities, bonds, and gold coincide with sharp USD
 weakness. The HMM-driven defensive positioning (heavy USD) leads to severe
