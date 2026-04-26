@@ -218,7 +218,9 @@ $$x_t = [r_t;\; \sigma_t;\; m_t] \in \mathbb{R}^{15}$$
 with $\sigma_t$ = 60-day rolling std of returns, $m_t$ = 20-day rolling mean.
 
 **Predictive K-selection (paper §5.2):**
-$$K_t = \arg\max_K \big\{\,\sum_{s \in \mathcal{V}_t} \log p(x_s|\mathcal{F}_{s-1}, K) - \lambda_K K\,\big\}$$
+$$
+K_t = \arg\max_{K} \left\{ \sum_{s \in \mathcal{V}_t} \log p(x_s \mid \mathcal{F}_{s-1}, K) - \lambda_K K \right\}
+$$
 
 **Wasserstein template assignment (paper §5.4):**
 $$g(k) = \arg\min_g\; W_2^2\big(\mathcal{N}(\mu_{t,k}, \Sigma_{t,k}),\; \mathcal{N}(\mu_g, \Sigma_g)\big)$$
