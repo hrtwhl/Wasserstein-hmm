@@ -24,6 +24,8 @@ to test whether the headline performance is window-specific. Key findings:
 | SPX Buy & Hold | 0.74 | -41.1% | — |
 | Equal-Weight (20% each) | 0.33 | -35.4% | — |
 
+![Cumulative PnL Comparison](outputs/fig11_benchmark_compare.png)
+
 **The strategy's value over a long sample is drawdown control, not return
 generation.** Risk-adjusted returns are roughly equal to passive SPX exposure,
 but maximum drawdown is reduced by approximately 4x (11% vs 41%). The headline
