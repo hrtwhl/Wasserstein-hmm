@@ -92,62 +92,7 @@ moments — same MVO layer, no regime structure.
 9. Figure generation
 10. Main orchestrator
 
-## Setup
-
-```bash
-git clone <this repo>
-cd Wasserstein-hmm
-pip install -r requirements.txt
-python replication.py
-```
-
-Tested on Python 3.10-3.12. No compiled solvers required.
-
-### Dependencies
-
-```
-numpy, pandas, scipy, scikit-learn, hmmlearn, yfinance, matplotlib
-```
-
-That's it. Earlier iterations used `cvxpy` for the MVO step, but it pulled in
-solver dependencies that caused install pain (ECOS, SCS, CLARABEL versioning).
-We replaced it with `scipy.optimize.minimize(method="SLSQP")` after verifying
-the two solvers agree to ~1e-5 tolerance across 50 random portfolio problems.
-
-## Running
-
-A single run:
-
-```bash
-python replication.py
-```
-
-Outputs land in `./outputs/`:
-
-- `table1_performance.csv` ... `table8_freq_comparison.csv` — paper tables 1-7
-  plus a new rebalance-frequency comparison
-- `fig01_*.png` ... `fig13_*.png` — paper figures 1-11 plus frequency-comparison
-  figures
-- `param_*_weights.csv`, `param_*_returns.csv` for daily/weekly/monthly variants
-- `param_extras.csv` — daily $K_t$ path, dominant template, and template
-  probabilities for diagnostic analysis
-
-### Caching
-
-The slow part is the rolling HMM fit (~40 min for 3 years, ~2.5 hours for
-15 years on a laptop). Once computed, the HMM signal — daily template
-probabilities and mixture moments — is cached to
-`data_cache/hmm_signal_<hash>.pkl`. Subsequent runs:
-
-- Reuse the cache when HMM-side parameters are unchanged (cache hit: ~0 sec)
-- Recompute when any of `OOS_START`, tickers, `K_MAX`, `LAMBDA_K`, `ETA`,
-  `G_TEMPLATES`, `HMM_FIT_FREQ`, etc. change
-
-This makes parameter sweeps over the cheap MVO-side knobs (`GAMMA`, `TAU`,
-`W_MAX`, rebalance frequency) feasible in seconds. Full HMM-side sweeps require
-recomputing the signal each time.
-
-To force a fresh signal: `rm -rf data_cache/hmm_signal_*.pkl`.
+´
 
 ## Key configuration
 
@@ -297,53 +242,3 @@ The L1 penalty is reformulated with positive slack variables $d^+, d^- \geq 0$
 satisfying $w - w_{t-1} = d^+ - d^-$, making the problem a smooth QP solvable
 by SLSQP.
 
-## Differences from the paper
-
-A few intentional implementation choices that depart from the paper's exact
-text:
-
-- **Solver:** scipy SLSQP rather than cvxpy. Numerically equivalent (verified
-  to 1e-5 across 50 random problems), avoids cvxpy's solver-dependency hell.
-- **Cache key:** the cache hashes *all* HMM-relevant config so accidental
-  parameter mismatches don't produce silently stale results.
-- **Tickers:** ETF proxies (SPY/AGG/GLD/USO/UUP) rather than indices/futures.
-  The paper says "S&P 500 Index proxy" etc. without specifying. UUP inception
-  (Feb 2007) is the binding date constraint.
-- **Default HMM refit cadence:** weekly (`HMM_FIT_FREQ = 5`). Paper does daily.
-  We measured the difference is < 0.05 Sharpe and chose the 5x faster default.
-  Set `REFIT_DAILY = True` for paper-exact behavior.
-
-## Replication checklist
-
-For thesis-grade reporting:
-
-- [x] Strict causality (features shifted +1 day before exposure)
-- [x] Closed-form Gaussian 2-Wasserstein distance via symmetric matrix sqrt
-- [x] Predictive log-likelihood K-selection with complexity penalty
-- [x] Template-based identity tracking with exponential smoothing
-- [x] Ledoit-Wolf shrinkage on $\Sigma_t$ before MVO
-- [x] L1 turnover penalty in MVO (slack reformulation for SLSQP)
-- [x] Long-only constraint with $w_{\max}=1$ box
-- [x] Cumulative log-return reporting (matches paper's figures)
-- [x] Per-regime asset and portfolio Sharpe attribution
-
-## Citation
-
-If you use this code:
-
-```bibtex
-@article{boukardagha2026,
-  author    = {Boukardagha, Amine},
-  title     = {Explainable Regime-Aware Investing},
-  journal   = {arXiv preprint},
-  year      = {2026},
-  eprint    = {2603.04441},
-  archivePrefix = {arXiv},
-  primaryClass = {q-fin.PM}
-}
-```
-
-## License
-
-Code released under MIT. The methodology follows Boukardagha (2026); please
-cite the paper for the underlying ideas.
